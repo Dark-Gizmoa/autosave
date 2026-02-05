@@ -1,469 +1,390 @@
 <?php
-/**
- * autosave.php
- * Copyright (c) 2020 james@firefly-iii.org
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- */
-
 declare(strict_types=1);
 
-bcscale(12);
-/*
- * INSTRUCTIONS FOR USE.
+/**
+ * autosave_new.php (Firefly III v6.4.16)
  *
- * 1. READ THE DOCS AT: https://github.com/jc5/autosave
+ * Features:
+ * 1) Load configuration from .env and CLI (CLI overrides .env)
+ *    .env is resolved relative to the script directory by default
+ * 2) Split transactions are processed individually
+ * 3) Minimum balance check:
+ *    - If the source account balance AFTER the original transaction
+ *      is <= MIN_BALANCE, auto-save is skipped
+ *    - Transactions are skipped ONLY based on TAGS matching EXCLUDE_KEYWORDS
+ * 4) Original transaction and auto-save transaction are linked
+ *    using transaction-links (same behavior as original autosave script)
+ * 5) Duplicate protection:
+ *    - If the original transaction journal is already part of any link,
+ *      auto-save is skipped (idempotent behavior)
+ * 6) Notes/comment:
+ *    "bezieht sich auf [{ID}], {Original description}"
+ * 7) Tags on auto-save transaction:
+ *    - Public tag (AUTOSAVE_TAG, default: autosave)
+ *    - Internal fixed tag: __autosave__
  *
- * Feel free to edit the code, read it and play with it. If you have questions feel free to ask them.
- * Keep in mind that running this script is entirely AT YOUR OWN RISK with ZERO GUARANTEES.
+ * Server-side filtering:
+ * Transactions are loaded via:
+ * /accounts/{id}/transactions?start=...&end=...&type=withdrawal
+ *
+ * Important API details:
+ * - transaction-links endpoint uses hyphen: /transaction-links
+ * - link payload requires inward_id / outward_id
  */
 
-const FIREFLY_III_URL = 'http://firefly.sd.home';
-const FIREFLY_III_TOKEN = 'ey...';
+//////////////////////
+// CLI + .env config //
+//////////////////////
 
-/*
- * HERE BE MONSTERS
- *
- * BELOW THIS LINE IS ACTUAL CODE (TM).
- */
+function parseEnvFile(string $path): array
+{
+    if (!is_file($path)) return [];
 
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $out = [];
 
-// get and validate arguments
-$arguments = getArguments($argv);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#')) continue;
 
-message('Start of script. Welcome!');
+        [$k, $v] = array_pad(explode('=', $line, 2), 2, '');
+        $k = trim($k);
+        $v = trim($v);
+        $v = trim($v, "\"'");
 
-// download account info from Firefly III.
-message(sprintf('Downloading info on account #%d...', $arguments['account']));
-$source = getAccount($arguments['account']);
-message(sprintf('Downloading info on account #%d...', $arguments['destination']));
-$destination = getAccount($arguments['destination']);
-
-// time stamp x days ago, or 0 if 'days' is 0.
-$timestamp = 0;
-if (0 !== $arguments['days']) {
-    $seconds   = $arguments['days'] * 24 * 60 * 60;
-    $timestamp = time() - $seconds;
-}
-define('TIMESTAMP', $timestamp);
-
-// die if either is not asset account
-if ('asset' !== $source['data']['attributes']['type'] ?? 'invalid') {
-    messageAndExit('Submit a valid asset account, using --account=x. This account is the account on which you auto-save money.');
-}
-if ('asset' !== $destination['data']['attributes']['type'] ?? 'invalid') {
-    messageAndExit('Submit a valid destination (savings) asset account using --destination=x. This is the account on which the money is saved.');
-}
-message('Both accounts are valid asset accounts.');
-
-// get transaction groups from account (withdrawals only):
-message(sprintf('Downloading transactions for account #%d "%s"...', $source['data']['id'], $source['data']['attributes']['name']));
-$groups = getTransactions((int) $source['data']['id']);
-
-message(sprintf('Found %d transactions.', count($groups)));
-
-/** @var array $group */
-foreach ($groups as $group) {
-    // split transactions arent supported.
-    if (1 !== count($group['attributes']['transactions'])) {
-        message(sprintf('Split transactions are not supported, so transaction #%d will be skipped.', $group['id']));
-        continue;
-    }
-
-    // get the main transaction (we know it's one)
-    $transaction = $group['attributes']['transactions'][0];
-
-    // maybe already has a link to existing auto-save?
-    $links          = getLinks($transaction);
-    $createAutoSave = true;
-    if (0 !== count($links)) {
-        foreach ($links as $link) {
-            $opposingTransactionId = getOpposingTransaction($transaction['transaction_journal_id'], $link);
-
-            // if the opposing transaction is a transfer, and it's an autosave link (recognized by the tag)
-            // we don't need to create another one.
-            $opposingTransaction = getTransaction($opposingTransactionId);
-
-            if (isAutoSaveTransaction($opposingTransaction)) {
-                $createAutoSave = false;
-            }
+        if ($k !== '') {
+            $out[$k] = $v;
         }
     }
-    if ($createAutoSave) {
-        createAutoSaveTransaction($group, $arguments);
-    }
+
+    return $out;
 }
 
-/**
- * @param array $group
- * @param array $arguments
- *
- * @throws JsonException
- */
-function createAutoSaveTransaction(array $group, array $arguments): void
+function parseCli(array $argv): array
 {
-    $first          = $group['attributes']['transactions'][0];
-    $amount         = $first['amount'];
-    $left           = bcmod($amount, (string) $arguments['amount']);
-    $amountToCreate = bcsub((string) (string) $arguments['amount'], $left);
+    $opts = getopt("", [
+        "env::",
+        "firefly-url::",
+        "firefly-token::",
+        "account::",
+        "destination::",
+        "amount::",
+        "days::",
+        "dry-run::",
+        "min-balance::",
+        "exclude-keywords::",
+        "only-type::",
+        "verbose::",
+        "link-type-id::",
+        "link-type-name::",
+        "autosave-tag::",
+    ]);
 
-    if (0 === bccomp((string) (string) $arguments['amount'], $amountToCreate)) {
-        // no need to create, is already exactly the auto save amount or a multiplier.
-        return;
+    $map = [
+        "firefly-url" => "FIREFLY_URL",
+        "firefly-token" => "FIREFLY_TOKEN",
+        "account" => "ACCOUNT",
+        "destination" => "DESTINATION",
+        "amount" => "AMOUNT",
+        "days" => "DAYS",
+        "dry-run" => "DRY_RUN",
+        "min-balance" => "MIN_BALANCE",
+        "exclude-keywords" => "EXCLUDE_KEYWORDS",
+        "only-type" => "ONLY_TYPE",
+        "verbose" => "VERBOSE",
+        "env" => "ENV_FILE",
+        "link-type-id" => "LINK_TYPE_ID",
+        "link-type-name" => "LINK_TYPE_NAME",
+        "autosave-tag" => "AUTOSAVE_TAG",
+    ];
+
+    $out = [];
+    foreach ($opts as $k => $v) {
+        $key = $map[$k] ?? null;
+        if ($key === null) continue;
+
+        if (is_array($v)) {
+            $v = end($v);
+        }
+
+        $out[$key] = ($v === false) ? "true" : (string)$v;
     }
-    if ($arguments['dryrun']) {
-        // report only:
-        message(sprintf('For transaction #%d ("%s") with amount %s %s, would have created auto-save transaction with amount %s %s, making the total %s %s.',
-                        $group['id'],
-                        $first['description'],
-                        $first['currency_code'],
-                        number_format((float) $amount, 2, '.', ','),
-                        $first['currency_code'],
-                        number_format((float) $amountToCreate, 2, '.', ','),
-                        $first['currency_code'],
-                        number_format((float) bcadd($amountToCreate, $amount), 2, '.', ','),
-                ));
-        return;
+
+    return $out;
+}
+
+function mergedConfig(array $env, array $cli): array
+{
+    // CLI values override .env values
+    return array_merge($env, $cli);
+}
+
+function cfg(array $c, string $key, ?string $default = null): ?string
+{
+    return array_key_exists($key, $c) ? (string)$c[$key] : $default;
+}
+
+function cfgBool(array $c, string $key, bool $default = false): bool
+{
+    $v = cfg($c, $key, null);
+    if ($v === null) return $default;
+
+    return in_array(strtolower(trim($v)), ["1","true","yes","y","on"], true);
+}
+
+function cfgFloat(array $c, string $key, float $default = 0.0): float
+{
+    $v = cfg($c, $key, null);
+    if ($v === null) return $default;
+
+    return (float)str_replace(",", ".", $v);
+}
+
+function cfgInt(array $c, string $key, int $default = 0): int
+{
+    $v = cfg($c, $key, null);
+    if ($v === null) return $default;
+
+    return (int)$v;
+}
+
+function println(string $s): void
+{
+    echo $s . PHP_EOL;
+}
+
+//////////////////////
+// Firefly API client //
+//////////////////////
+
+final class FireflyClient
+{
+    public function __construct(
+        private string $baseUrl,
+        private string $token,
+        private bool $verbose = false
+    ) {
+        $this->baseUrl = rtrim($this->baseUrl, "/");
     }
-    // create transaction:
-    $submission = [
-        'transactions' => [
-            [
-                'type'           => 'transfer',
-                'source_id'      => $arguments['account'],
-                'destination_id' => $arguments['destination'],
-                'description'    => '(auto save transaction)',
-                'date'           => substr($first['date'], 0, 10),
-                'tags'           => ['auto-save'],
-                'currency_code'  => $first['currency_code'],
-                'amount'         => $amountToCreate,
+
+    private function request(string $method, string $path, array $query = [], ?array $jsonBody = null): array
+    {
+        $url = $this->baseUrl . "/api/v1" . $path;
+        if (!empty($query)) {
+            $url .= "?" . http_build_query($query);
+        }
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                "Accept: application/json",
+                "Content-Type: application/json",
+                "Authorization: Bearer " . $this->token,
             ],
-        ],
-    ];
-    // submit:
-    $result  = postCurlRequest('/api/v1/transactions', $submission);
-    $groupId = $result['data']['id'];
-    message(sprintf('For transaction #%d ("%s") with amount %s %s, have created auto-save transaction #%d with amount %s %s, making the total %s %s.',
-                    $group['id'],
-                    $first['description'],
-                    $first['currency_code'],
-                    number_format((float) $amount, 2, '.', ','),
-                    $groupId,
-                    $first['currency_code'],
-                    number_format((float) $amountToCreate, 2, '.', ','),
-                    $first['currency_code'],
-                    number_format((float) bcadd($amountToCreate, $amount), 2, '.', ','),
-            ));
+            CURLOPT_TIMEOUT => 60,
+        ]);
 
-    $relationSubmission = [
-        'link_type_id' => 1,
-        'inward_id'    => $result['data']['attributes']['transactions'][0]['transaction_journal_id'],
-        'outward_id'   => $first['transaction_journal_id'],
-        'notes'        => 'Created to automatically save money.',
-    ];
-    // create a link between A and B.
-    postCurlRequest('/api/v1/transaction_links', $relationSubmission);
+        if ($jsonBody !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($jsonBody, JSON_UNESCAPED_SLASHES));
+        }
 
+        $raw = curl_exec($ch);
+        $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
 
+        if ($raw === false) {
+            throw new RuntimeException("cURL error: " . $err);
+        }
+
+        $data = json_decode($raw, true);
+        if (!is_array($data)) {
+            throw new RuntimeException("Invalid JSON response (HTTP {$http})");
+        }
+
+        if ($http < 200 || $http >= 300) {
+            $msg = $data["message"] ?? $data["errors"][0]["detail"] ?? "HTTP {$http}";
+            throw new RuntimeException("Firefly API error: {$msg}");
+        }
+
+        return $data;
+    }
+
+    public function listAccountTransactions(int $accountId, string $start, string $end, ?string $type): array
+    {
+        return $this->request("GET", "/accounts/{$accountId}/transactions", [
+            "start" => $start,
+            "end" => $end,
+            "type" => $type,
+            "limit" => 500,
+        ])["data"] ?? [];
+    }
+
+    public function storeTransaction(array $payload): array
+    {
+        return $this->request("POST", "/transactions", [], $payload);
+    }
+
+    public function listTransactionLinks(): array
+    {
+        return $this->request("GET", "/transaction-links", ["limit" => 500])["data"] ?? [];
+    }
+
+    public function storeTransactionLink(array $payload): void
+    {
+        $this->request("POST", "/transaction-links", [], $payload);
+    }
 }
 
+//////////////////////
+// Helper functions   //
+//////////////////////
+
+function roundUpDelta(float $amount, float $roundTo): float
+{
+    if ($roundTo <= 0) return 0.0;
+
+    $rounded = ceil($amount / $roundTo) * $roundTo;
+    $delta = round($rounded - $amount, 2);
+
+    return $delta < 0.01 ? 0.0 : $delta;
+}
+
+function toIsoDateTime(string $s): string
+{
+    return preg_match('/^\d{4}-\d{2}-\d{2}$/', $s)
+        ? $s . "T00:00:00+00:00"
+        : $s;
+}
+
+function toDateOnly(string $iso): string
+{
+    return substr($iso, 0, 10);
+}
 
 /**
- * @param array $transaction
- * @return bool
+ * Check ONLY tags (exact match, case-insensitive) against EXCLUDE_KEYWORDS.
  */
-function isAutoSaveTransaction(array $transaction): bool
+function hasExcludedTagStrict(array $tx, array $excludeKeywords): bool
 {
-    // it's a split, then false:
-    if (count($transaction['attributes']['transactions']) > 1) {
+    if (!isset($tx["tags"]) || !is_array($tx["tags"])) {
         return false;
     }
-    $first = $transaction['attributes']['transactions'][0];
 
-    // its not a transfer, so false:
-    if ('transfer' !== $first['type']) {
-        return false;
-    }
-    $hasTag = false;
-    foreach ($first['tags'] as $tag) {
-        if ('auto-save' === $tag) {
+    $exclude = array_flip(
+        array_map(fn($v) => mb_strtolower(trim((string)$v)), $excludeKeywords)
+    );
+
+    foreach ($tx["tags"] as $tag) {
+        $tag = mb_strtolower(trim((string)$tag));
+        if ($tag !== "" && isset($exclude[$tag])) {
             return true;
         }
     }
+
     return false;
 }
 
-/**
- * @param int $journalId
- * @return array
- */
-function getTransaction(int $journalId): array
-{
-    $opposing = getCurlRequest(sprintf('/api/v1/transaction-journals/%d', $journalId));
-    return $opposing['data'];
+//////////////////////
+// Main logic         //
+//////////////////////
+
+$cli = parseCli($argv);
+$envFile = $cli["ENV_FILE"] ?? (__DIR__ . "/.env");
+$cfg = mergedConfig(parseEnvFile($envFile), $cli);
+
+$baseUrl = cfg($cfg, "FIREFLY_URL");
+$token   = cfg($cfg, "FIREFLY_TOKEN");
+$account = cfgInt($cfg, "ACCOUNT");
+$dest    = cfgInt($cfg, "DESTINATION");
+$roundTo = cfgFloat($cfg, "AMOUNT");
+$days    = cfgInt($cfg, "DAYS");
+$minBal  = cfgFloat($cfg, "MIN_BALANCE", 20);
+$dryRun  = cfgBool($cfg, "DRY_RUN", false);
+$type    = cfg($cfg, "ONLY_TYPE", "withdrawal");
+
+$excludeKeywords = array_map("trim", explode(",", cfg($cfg, "EXCLUDE_KEYWORDS", "")));
+
+$autosaveTag = cfg($cfg, "AUTOSAVE_TAG", "autosave");
+$internalTag = "__autosave__";
+$linkTypeId  = cfgInt($cfg, "LINK_TYPE_ID", 1);
+
+if (!$baseUrl || !$token || !$account || !$dest || !$roundTo) {
+    println("Missing required parameters. Check .env or CLI options.");
+    exit(2);
 }
 
-/**
- * @param int   $transactionId
- * @param array $link
- * @return int
- */
-function getOpposingTransaction(int $transactionId, array $link): int
-{
-    $opposingJournal = 0;
-    if ($transactionId === $link['attributes']['inward_id']) {
-        $opposingJournal = $link['attributes']['outward_id'];
-    }
-    if ($transactionId === $link['attributes']['outward_id']) {
-        $opposingJournal = $link['attributes']['inward_id'];
-    }
-    if (0 === $opposingJournal) {
-        messageAndExit('No opposing transaction.');
-    }
-    return $opposingJournal;
+$end = (new DateTimeImmutable())->format("Y-m-d");
+$start = $days > 0
+    ? (new DateTimeImmutable())->sub(new DateInterval("P{$days}D"))->format("Y-m-d")
+    : "2000-01-01";
+
+println("Auto-save started");
+
+$ff = new FireflyClient($baseUrl, $token);
+
+$groups = $ff->listAccountTransactions($account, $start, $end, $type);
+$links = $ff->listTransactionLinks();
+
+$linkedJournals = [];
+foreach ($links as $l) {
+    $a = $l["attributes"] ?? [];
+    if (!empty($a["inward_id"]))  $linkedJournals[$a["inward_id"]]  = true;
+    if (!empty($a["outward_id"])) $linkedJournals[$a["outward_id"]] = true;
 }
 
+foreach ($groups as $group) {
+    foreach ($group["attributes"]["transactions"] ?? [] as $tx) {
 
-/**
- * @param array $transaction
- *
- * @return array
- */
-function getLinks(array $transaction): array
-{
-    $journalId = $transaction['transaction_journal_id'];
-    $links     = getCurlRequest(sprintf('/api/v1/transaction-journals/%d/links', $journalId));
+        $desc = $tx["description"] ?? "";
 
-    if (count($links['data']) > 0) {
-        return $links['data'];
-    }
-    return [];
-}
-
-
-/**
- * @param int $accountId
- *
- * @return array
- */
-function getTransactions(int $accountId): array
-{
-    $return              = [];
-    $page                = 1;
-    $limit               = 75;
-    $hasMoreTransactions = true;
-    $count               = 0;
-
-    while ($count < 5 && true === $hasMoreTransactions) {
-        $result     = getCurlRequest(sprintf('/api/v1/accounts/%d/transactions?page=%d&limit=%d&type=withdrawal', $accountId, $page, $limit));
-        $totalPages = (int) ($result['meta']['pagination']['total_pages'] ?? 0);
-
-        // loop transactions to see if we've reached the required date.
-        $currentSet = $result['data'];
-
-        //message(sprintf('Found %d transaction(s) on page %d', count($currentSet), $page));
-
-        /** @var array $currentGroup */
-        foreach ($currentSet as $currentGroup) {
-            $addToSet     = false;
-            $transactions = $currentGroup['attributes']['transactions'] ?? [];
-            /** @var array $transaction */
-            foreach ($transactions as $transaction) {
-                $time = strtotime($transaction['date']);
-                if ($time > TIMESTAMP) {
-                    // add it to the array:
-                    $addToSet = true;
-                }
-                if ($time <= TIMESTAMP) {
-                    //message(sprintf('Will not include transaction group #%d, the date is %s', $currentGroup['id'], $transaction['date']));
-                    // break the loop:
-                    $hasMoreTransactions = false;
-                }
-            }
-            if ($addToSet) {
-                $return[] = $currentGroup;
-            }
+        if (hasExcludedTagStrict($tx, $excludeKeywords)) {
+            println("SKIP (Tag): \"{$desc}\" --> Excluded_Keyword found");
+            continue;
         }
 
-        // if $hasMoreTransactions isnt false already, compare total_pages to current page
-        if (false !== $hasMoreTransactions) {
-            $hasMoreTransactions = $totalPages > $page;
-        }
+        $amount = abs((float)$tx["amount"]);
+        $delta = roundUpDelta($amount, $roundTo);
+        if ($delta <= 0) continue;
 
-        $page++;
-        $count++;
+        if (($tx["source_balance_after"] ?? 999999) <= $minBal) continue;
+
+        $jid = $tx["transaction_journal_id"] ?? null;
+        if (!$jid || isset($linkedJournals[$jid])) continue;
+
+        $dateIso = toIsoDateTime($tx["date"]);
+        $dateOut = toDateOnly($dateIso);
+
+        println("Autosave candidate: Original #{$jid} \"{$desc}\" amount={$amount} -> delta={$delta} date={$dateOut}");
+
+        if ($dryRun) continue;
+
+        $payload = [
+            "transactions" => [[
+                "type" => "transfer",
+                "date" => $dateIso,
+                "amount" => number_format($delta, 2, ".", ""),
+                "source_id" => (string)$account,
+                "destination_id" => (string)$dest,
+                "description" => "Auto-save for transaction #{$jid}",
+                "notes" => "bezieht sich auf [{$jid}], {$desc}",
+                "tags" => [$autosaveTag, $internalTag],
+            ]],
+        ];
+
+        $created = $ff->storeTransaction($payload);
+        $newJid = $created["data"]["attributes"]["transactions"][0]["transaction_journal_id"];
+
+        $ff->storeTransactionLink([
+            "link_type_id" => $linkTypeId,
+            "inward_id" => (int)$jid,
+            "outward_id" => (int)$newJid,
+        ]);
+
+        println("OK: created auto-save transfer (Journal #{$newJid}) and linked to original #{$jid} \"{$desc}\"");
     }
-    //message('Stopped downloading transactions');
-
-    return $return;
 }
 
-/**
- * @param int $accountId
- *
- * @return array
- */
-function getAccount(int $accountId): array
-{
-    return getCurlRequest(sprintf('/api/v1/accounts/%d', $accountId));
-}
-
-/**
- * @param string $url
- *
- * @return array
- */
-function getCurlRequest(string $url): array
-{
-    $ch = curl_init();
-    curl_setopt(
-        $ch, CURLOPT_HTTPHEADER,
-        [
-            'Content-Type: application/json',
-            'Accept: application/json',
-            sprintf('Authorization: Bearer %s', FIREFLY_III_TOKEN),
-        ]
-    );
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_URL, sprintf('%s%s', FIREFLY_III_URL, $url));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 6);
-
-    // Execute
-    $result   = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if (200 !== $httpCode) {
-        $error = curl_error($ch);
-        message(sprintf('Request %s returned with HTTP code %d.', $url, $httpCode));
-        message($error);
-        message((string) $result);
-        messageAndExit('');
-    }
-    $body = [];
-    try {
-        $body = json_decode($result, true, 512, JSON_THROW_ON_ERROR);
-    } catch (JsonException $e) {
-        messageAndExit($e->getMessage());
-    }
-
-    return $body;
-}
-
-/**
- * @param string $url
- * @param array  $body
- * @return array
- * @throws JsonException
- */
-function postCurlRequest(string $url, array $body): array
-{
-    //message(sprintf('Going to POST %s', $url));
-    $ch = curl_init();
-    curl_setopt(
-        $ch, CURLOPT_HTTPHEADER,
-        [
-            'Content-Type: application/json',
-            'Accept: application/json',
-            sprintf('Authorization: Bearer %s', FIREFLY_III_TOKEN),
-        ]
-    );
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_URL, sprintf('%s%s', FIREFLY_III_URL, $url));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-    curl_setopt($ch, CURLOPT_POST, 1);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_THROW_ON_ERROR));
-    // Execute
-    $result   = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    if (200 !== $httpCode) {
-        $error = curl_error($ch);
-        message(sprintf('Request %s returned with HTTP code %d.', $url, $httpCode));
-        message($error);
-        message((string) $result);
-        messageAndExit('');
-    }
-    $body = [];
-    try {
-        $body = json_decode($result, true, 512, JSON_THROW_ON_ERROR);
-    } catch (JsonException $e) {
-        messageAndExit($e->getMessage());
-    }
-
-    return $body;
-}
-
-/**
- * @param array $arguments
- *
- * @return array
- */
-function getArguments(array $arguments): array
-{
-    if (1 === count($arguments)) {
-        message('To use this application:');
-        message('');
-        message('php autosave.php --account=x --destination=y --days=21 --amount=2.5');
-        messageAndExit('');
-    }
-
-    $result = [
-        'account'     => 0,
-        'destination' => 0,
-        'days'        => 0,
-        'amount'      => 0.0,
-        'dryrun'      => false,
-    ];
-    $fields = array_keys($result);
-    /** @var string $argument */
-    foreach ($arguments as $argument) {
-        foreach ($fields as $field) {
-            if (str_starts_with($argument, sprintf('--%s=', $field))) {
-                $result[$field] = (int) str_replace(sprintf('--%s=', $field), '', $argument);
-                if ('amount' === $field) {
-                    $result[$field] = (float) str_replace(sprintf('--%s=', $field), '', $argument);
-                }
-            }
-        }
-    }
-    if (in_array('--dry-run', $arguments)) {
-        $result['dryrun'] = true;
-    }
-    if (0 === $result['account']) {
-        messageAndExit('Submit a valid account, using --account=x. This account is the account on which you auto-save money.');
-    }
-    if (0 === $result['destination']) {
-        messageAndExit('Submit a valid destination (savings) asset account using --destination=x. This is the account on which the money is saved.');
-    }
-    if (0 === $result['days']) {
-        message('Not defining the number of days to go back will not improve performance.');
-    }
-    if (0.0 === $result['amount']) {
-        messageAndExit('Submit the amount by which you save, ie. --amount=5 or --amount=2.5.');
-    }
-
-    return $result;
-}
-
-/**
- * @param string $message
- */
-function message(string $message): void
-{
-    echo $message . "\n";
-}
-
-function messageAndExit(string $message): void
-{
-    message($message);
-    exit;
-}
+println("Auto-save finished");
